@@ -1,0 +1,178 @@
+name: Build Moonlight XrOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.4.1.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+
+    steps:
+      - name: Download upstream source and submodules
+        uses: actions/checkout@v4
+        with:
+          repository: RikuKunMS2/moonlight-ios-vision
+          # Upstream vision-testflight commit inspected on 2026-10-21.
+          ref: fb349830ac980ab73dbd653b5b9c813c3b249198
+          submodules: recursive
+          persist-credentials: false
+          path: source
+
+      - name: Check the Xcode and visionOS SDK
+        run: |
+          mkdir -p cloud-build
+          xcodebuild -version | tee cloud-build/xcode-version.txt
+          xcrun --sdk xros --show-sdk-version
+          git rev-parse HEAD > cloud-build/source-commit.txt
+          git submodule status --recursive > cloud-build/submodules.txt
+
+      - name: Prepare the project for a cloud build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import plistlib
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          project_path = Path('Moonlight.xcodeproj/project.pbxproj')
+          project_text = project_path.read_text()
+
+          # Resolve the SDK from the selected Xcode instead of an old SDK path.
+          for framework in ('UIKit', 'RealityKit'):
+              old = (
+                  'path = Platforms/XROS.platform/Developer/SDKs/XROS1.0.sdk/'
+                  f'System/Library/Frameworks/{framework}.framework; '
+                  'sourceTree = DEVELOPER_DIR;'
+              )
+              new = (
+                  f'path = System/Library/Frameworks/{framework}.framework; '
+                  'sourceTree = SDKROOT;'
+              )
+              if old not in project_text:
+                  raise SystemExit(f'Expected SDK reference not found: {framework}')
+              project_text = project_text.replace(old, new)
+          project_path.write_text(project_text)
+
+          # Decode the project without installing any third-party Python modules.
+          project = json.loads(subprocess.check_output([
+              'plutil', '-convert', 'json', '-o', '-', str(project_path)
+          ]))
+          targets = [
+              (key, value) for key, value in project['objects'].items()
+              if value.get('isa') == 'PBXNativeTarget'
+              and value.get('name') == 'Moonlight XrOS'
+          ]
+          if len(targets) != 1:
+              raise SystemExit('Expected exactly one Moonlight XrOS application target')
+          target_id, target = targets[0]
+          product = project['objects'][target['productReference']]['path']
+
+          # The upstream repository does not include a shared build scheme.
+          scheme = ET.Element('Scheme', LastUpgradeVersion='2640', version='1.3')
+          action = ET.SubElement(scheme, 'BuildAction',
+                                 parallelizeBuildables='YES',
+                                 buildImplicitDependencies='YES')
+          entries = ET.SubElement(action, 'BuildActionEntries')
+          entry = ET.SubElement(entries, 'BuildActionEntry',
+                                buildForTesting='NO', buildForRunning='YES',
+                                buildForProfiling='YES', buildForArchiving='YES',
+                                buildForAnalyzing='YES')
+          ET.SubElement(entry, 'BuildableReference', BuildableIdentifier='primary',
+                        BlueprintIdentifier=target_id,
+                        BuildableName=product,
+                        BlueprintName=target['name'],
+                        ReferencedContainer='container:Moonlight.xcodeproj')
+          ET.SubElement(scheme, 'ArchiveAction', buildConfiguration='Release',
+                        revealArchiveInOrganizer='NO')
+          scheme_dir = Path('Moonlight.xcodeproj/xcshareddata/xcschemes')
+          scheme_dir.mkdir(parents=True, exist_ok=True)
+          ET.indent(scheme)
+          ET.ElementTree(scheme).write(scheme_dir / 'CloudVision.xcscheme',
+                                      encoding='UTF-8', xml_declaration=True)
+
+          # Correct a legacy iOS capability in the shared application Info.plist.
+          info_path = Path('Moonlight copy-Info.plist')
+          info = plistlib.loads(info_path.read_bytes())
+          caps = info.get('UIRequiredDeviceCapabilities', [])
+          if isinstance(caps, list):
+              info['UIRequiredDeviceCapabilities'] = [
+                  'arm64' if cap == 'armv7' else cap for cap in caps
+              ]
+          info_path.write_bytes(plistlib.dumps(info, sort_keys=False))
+
+          print(f'Prepared target {target["name"]}: {product}')
+          PY
+
+      - name: Compile the visionOS device application without signing
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Moonlight.xcodeproj \
+            -scheme CloudVision \
+            -configuration Release \
+            -sdk xros \
+            -destination 'generic/platform=visionOS' \
+            -derivedDataPath "$PWD/cloud-build/DerivedData" \
+            -archivePath "$PWD/cloud-build/Moonlight.xcarchive" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGN_ENTITLEMENTS= \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            2>&1 | tee cloud-build/build.log
+
+      - name: Package the unsigned IPA
+        run: |
+          app='cloud-build/Moonlight.xcarchive/Products/Applications/Moonlight XrOS.app'
+          test -d "$app"
+          mkdir -p cloud-build/package/Payload cloud-build/dist
+          /usr/bin/ditto "$app" 'cloud-build/package/Payload/Moonlight XrOS.app'
+          (
+            cd cloud-build/package
+            /usr/bin/zip -qry ../dist/Moonlight-XrOS-unsigned.ipa Payload
+          )
+          /usr/bin/zip -T cloud-build/dist/Moonlight-XrOS-unsigned.ipa
+          cp cloud-build/source-commit.txt cloud-build/dist/
+          cp cloud-build/xcode-version.txt cloud-build/dist/
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist" \
+            > cloud-build/dist/minimum-visionOS-version.txt
+          (
+            cd cloud-build/dist
+            shasum -a 256 Moonlight-XrOS-unsigned.ipa > SHA256SUMS.txt
+          )
+          echo 'Unsigned IPA created. Sign it before installation on Vision Pro.'
+
+      - name: Save the IPA download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Moonlight-XrOS-unsigned
+          path: source/cloud-build/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Save build logs for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Moonlight-build-logs
+          path: |
+            source/cloud-build/build.log
+            source/cloud-build/source-commit.txt
+            source/cloud-build/submodules.txt
+            source/cloud-build/xcode-version.txt
+          if-no-files-found: warn
+          retention-days: 14
