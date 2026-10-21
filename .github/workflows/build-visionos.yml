@@ -48,6 +48,28 @@ jobs:
           project_path = Path('Moonlight.xcodeproj/project.pbxproj')
           project_text = project_path.read_text()
 
+          # Xcode.app on the runner can be a different version from DEVELOPER_DIR.
+          # Its headers caused a duplicate SwiftBridging module in the first run.
+          # The selected compiler already supplies its own toolchain headers.
+          stale_header_path = (
+              '/Applications/Xcode.app/Contents/Developer/'
+              'Toolchains/XcodeDefault.xctoolchain/usr/include'
+          )
+          project_lines = project_text.splitlines(keepends=True)
+          stale_header_lines = [
+              line for line in project_lines
+              if line.strip() == stale_header_path + ','
+          ]
+          if len(stale_header_lines) != 4:
+              raise SystemExit('Expected four hardcoded toolchain header entries')
+          project_text = ''.join(
+              line for line in project_lines
+              if line.strip() != stale_header_path + ','
+          )
+          if stale_header_path in project_text:
+              raise SystemExit('A hardcoded toolchain header reference remains')
+          print(f'Removed {len(stale_header_lines)} hardcoded toolchain header entries')
+
           # Resolve the SDK from the selected Xcode instead of an old SDK path.
           for framework in ('UIKit', 'RealityKit'):
               old = (
